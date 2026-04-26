@@ -7,36 +7,49 @@ from config import API_TIMEOUT
 logger = logging.getLogger(__name__)
 
 # Ports a tester automatiquement si aucun port dans l'URL
-FALLBACK_PORTS = [8080, 80, 25461, 2082, 8000]
+FALLBACK_PORTS = [80, 8080, 8000, 25461, 2082]
 
 
 def normalize_host(host):
     """
-    Normalise l'URL du serveur.
+    Normalise l'URL du serveur :
+    - Supprime les espaces
     - Ajoute http:// si absent
-    - Conserve le port si deja present
-    - Retourne l'URL propre sans slash final
+    - Supprime le slash final
+    - NE supprime PAS le www. (fait partie du domaine)
+    Exemples :
+      'kdfgh.com:8080'        -> 'http://kdfgh.com:8080'
+      'http://kdfgh.com:8080' -> 'http://kdfgh.com:8080'
+      'http://www.r56mail.com/' -> 'http://www.r56mail.com'
+      'www.r56mail.com'       -> 'http://www.r56mail.com'
     """
     host = host.strip()
+    if not host:
+        return host
+    # Ajoute le schema si absent
     if not host.startswith("http://") and not host.startswith("https://"):
         host = "http://" + host
-    return host.rstrip("/")
+    # Supprime le slash final
+    host = host.rstrip("/")
+    return host
 
 
-def has_port(host):
+def has_explicit_port(host):
     """
     Detecte si l'URL contient deja un port explicite.
     Exemples :
-      http://mon.serveur.com:8080  -> True
-      http://mon.serveur.com       -> False
-      https://mon.serveur.com:443  -> True
+      http://kdfgh.com:8080      -> True
+      http://www.r56mail.com     -> False
+      https://serveur.com:443    -> True
     """
     try:
-        # Retire le schema
+        # Retire le schema http:// ou https://
         without_schema = re.sub(r'^https?://', '', host)
-        # Le hostname/ip peut contenir ':port'
-        parts = without_schema.split("/")[0]  # retire tout apres le premier /
-        return ":" in parts
+        # Prend uniquement le host:port (avant le premier /)
+        host_part = without_schema.split("/")[0]
+        # Verifie si il y a un ':' dans la partie host (signe d'un port)
+        # Attention : IPv6 contient des ':' aussi, on ignore ce cas rare
+        return bool(re.search(r':\d+$', host_part))
     except Exception:
         return False
 
@@ -47,28 +60,35 @@ def test_auth_url(host, username, password):
     Retourne (data_dict, None) si succes, (None, error_str) si echec.
     """
     url = f"{host}/player_api.php?username={username}&password={password}"
+    logger.debug(f"Test auth sur : {url}")
     try:
         resp = requests.get(url, timeout=API_TIMEOUT)
-        resp.raise_for_status()
-        data = resp.json()
+        # Certains serveurs retournent 403/404 meme avec de bons identifiants
+        # On tente quand meme de parser le JSON
+        try:
+            data = resp.json()
+        except ValueError:
+            return None, f"Reponse non-JSON (status={resp.status_code}) sur {host}"
+
         if not isinstance(data, dict):
-            return None, "Reponse JSON invalide"
+            return None, f"JSON invalide (pas un objet) sur {host}"
+
         user_info = data.get("user_info", {})
-        # Accepte auth=1 (int) OU auth='1' (string) OU absence de champ auth (certains serveurs)
+        # Accepte auth=1 (int), auth='1' (string), ou absence du champ
         auth_val = user_info.get("auth", 1)
         if str(auth_val) == "0":
             return None, "Identifiants incorrects (auth=0)"
+
         return data, None
+
     except requests.exceptions.Timeout:
-        return None, f"Timeout sur {host}"
-    except requests.exceptions.ConnectionError:
-        return None, f"Connexion impossible sur {host}"
+        return None, f"Timeout (>{API_TIMEOUT}s) sur {host}"
+    except requests.exceptions.ConnectionError as e:
+        return None, f"Connexion refusee sur {host} : {e}"
     except requests.exceptions.HTTPError as e:
         return None, f"Erreur HTTP {e} sur {host}"
-    except ValueError:
-        return None, f"Reponse non-JSON sur {host}"
     except Exception as e:
-        return None, str(e)
+        return None, f"Erreur inattendue sur {host} : {e}"
 
 
 class XtreamClient:
@@ -76,9 +96,12 @@ class XtreamClient:
         self.host = normalize_host(host)
         self.username = username
         self.password = password
+        self._update_base_url()
+
+    def _update_base_url(self):
         self.base_url = (
             f"{self.host}/player_api.php"
-            f"?username={username}&password={password}"
+            f"?username={self.username}&password={self.password}"
         )
 
     def _get(self, params=""):
@@ -100,38 +123,41 @@ class XtreamClient:
 
     def authenticate(self):
         """
-        Authentification avec fallback automatique sur plusieurs ports.
-        Fonctionne pour : KDMAX (:8080), KING365 (sans port), Shooters (sans port).
+        Authentification robuste :
+        1. Teste l'URL telle quelle
+        2. Si echec ET pas de port -> teste les ports alternatifs
+        3. Remonte une erreur claire si tout echoue
+
+        Compatible avec :
+        - KDMAX  : http://kdfgh.com:8080  (port explicite)
+        - KING365: http://www.r56mail.com (sans port, www.)
+        - Shooters et autres sans port
         """
-        # Tentative 1 : URL telle quelle
+        # Tentative directe
         data, err = test_auth_url(self.host, self.username, self.password)
         if data:
-            logger.info(f"Connexion reussie sur {self.host}")
+            logger.info(f"[AUTH] Connexion reussie sur {self.host}")
             return data
 
-        logger.warning(f"Echec sur {self.host} : {err}")
+        logger.warning(f"[AUTH] Echec direct sur {self.host} : {err}")
 
-        # Si l'URL n'a pas de port, on teste les ports alternatifs
-        if not has_port(self.host):
+        # Si pas de port explicite, on teste les fallback
+        if not has_explicit_port(self.host):
             for port in FALLBACK_PORTS:
-                # Construit l'URL avec ce port
                 test_host = f"{self.host}:{port}"
                 data, err2 = test_auth_url(test_host, self.username, self.password)
                 if data:
-                    logger.info(f"Connexion reussie sur {test_host} (fallback)")
-                    # Met a jour le host pour les requetes suivantes
+                    logger.info(f"[AUTH] Connexion reussie sur {test_host} (fallback port {port})")
                     self.host = test_host
-                    self.base_url = (
-                        f"{self.host}/player_api.php"
-                        f"?username={self.username}&password={self.password}"
-                    )
+                    self._update_base_url()
                     return data
-                logger.warning(f"Echec sur {test_host} : {err2}")
+                logger.warning(f"[AUTH] Echec port {port} : {err2}")
 
-        # Si tout a echoue, on remonte l'erreur originale
+        # Tout a echoue
         raise ConnectionError(
-            f"Connexion impossible.\n"
+            f"Connexion impossible au serveur.\n"
             f"Verifie l'URL, le port, le nom d'utilisateur et le mot de passe.\n"
+            f"URL testee : {self.host}\n"
             f"Derniere erreur : {err}"
         )
 
@@ -139,7 +165,7 @@ class XtreamClient:
         try:
             return self._get("action=get_live_categories") or []
         except Exception as e:
-            logger.error(f"Erreur get_live_categories: {e}")
+            logger.error(f"Erreur get_live_categories : {e}")
             return []
 
     def get_live_streams(self, category_id=None):
@@ -149,14 +175,14 @@ class XtreamClient:
                 params += f"&category_id={category_id}"
             return self._get(params) or []
         except Exception as e:
-            logger.error(f"Erreur get_live_streams: {e}")
+            logger.error(f"Erreur get_live_streams : {e}")
             return []
 
     def get_vod_categories(self):
         try:
             return self._get("action=get_vod_categories") or []
         except Exception as e:
-            logger.error(f"Erreur get_vod_categories: {e}")
+            logger.error(f"Erreur get_vod_categories : {e}")
             return []
 
     def get_vod_streams(self, category_id=None):
@@ -166,14 +192,14 @@ class XtreamClient:
                 params += f"&category_id={category_id}"
             return self._get(params) or []
         except Exception as e:
-            logger.error(f"Erreur get_vod_streams: {e}")
+            logger.error(f"Erreur get_vod_streams : {e}")
             return []
 
     def get_series_categories(self):
         try:
             return self._get("action=get_series_categories") or []
         except Exception as e:
-            logger.error(f"Erreur get_series_categories: {e}")
+            logger.error(f"Erreur get_series_categories : {e}")
             return []
 
     def get_series(self, category_id=None):
@@ -183,21 +209,21 @@ class XtreamClient:
                 params += f"&category_id={category_id}"
             return self._get(params) or []
         except Exception as e:
-            logger.error(f"Erreur get_series: {e}")
+            logger.error(f"Erreur get_series : {e}")
             return []
 
     def get_series_info(self, series_id):
         try:
             return self._get(f"action=get_series_info&series_id={series_id}") or {}
         except Exception as e:
-            logger.error(f"Erreur get_series_info: {e}")
+            logger.error(f"Erreur get_series_info : {e}")
             return {}
 
     def get_vod_info(self, vod_id):
         try:
             return self._get(f"action=get_vod_info&vod_id={vod_id}") or {}
         except Exception as e:
-            logger.error(f"Erreur get_vod_info: {e}")
+            logger.error(f"Erreur get_vod_info : {e}")
             return {}
 
     def build_live_url(self, stream_id, ext="ts"):
@@ -218,7 +244,7 @@ class M3UParser:
                 content = f.read()
             return M3UParser.parse_content(content)
         except Exception as e:
-            logger.error(f"Erreur lecture M3U {filepath}: {e}")
+            logger.error(f"Erreur lecture M3U {filepath} : {e}")
             return []
 
     @staticmethod
@@ -228,7 +254,7 @@ class M3UParser:
             resp.raise_for_status()
             return M3UParser.parse_content(resp.text)
         except Exception as e:
-            logger.error(f"Erreur telechargement M3U {url}: {e}")
+            logger.error(f"Erreur telechargement M3U {url} : {e}")
             return []
 
     @staticmethod
@@ -267,5 +293,5 @@ class M3UParser:
             if id_match:
                 info["stream_id"] = id_match.group(1)
         except Exception as e:
-            logger.warning(f"Erreur parse EXTINF: {e}")
+            logger.warning(f"Erreur parse EXTINF : {e}")
         return info
