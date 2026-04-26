@@ -1,0 +1,80 @@
+name: Build IPTV Azure Windows
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v4
+
+      - name: Installation Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Installation VLC via Chocolatey
+        run: choco install vlc -y
+        shell: cmd
+
+      - name: Installation Inno Setup via Chocolatey
+        run: choco install innosetup -y
+        shell: cmd
+
+      - name: Installation des dependances Python
+        run: pip install -r requirements.txt pyinstaller
+        shell: cmd
+
+      - name: Verification syntaxe Python
+        run: |
+          python -c "import ast; import os"
+          python -c "import ast; ast.parse(open('main.py').read())"
+          python -c "import ast; ast.parse(open('config.py').read())"
+          python -c "import ast; ast.parse(open('ui/styles.py').read())"
+          python -c "import ast; ast.parse(open('ui/login_screen.py').read())"
+          python -c "import ast; ast.parse(open('ui/player_widget.py').read())"
+          python -c "import ast; ast.parse(open('ui/main_window.py').read())"
+          python -c "import ast; ast.parse(open('utils/api.py').read())"
+          python -c "import ast; ast.parse(open('utils/data_manager.py').read())"
+          python -c "import ast; ast.parse(open('utils/workers.py').read())"
+        shell: cmd
+
+      - name: Build PyInstaller (one-dir windowed)
+        run: |
+          set VLC_DIR=C:\Program Files\VideoLAN\VLC
+          pyinstaller --noconfirm --onedir --windowed --name "IPTV-Azure" ^
+            --add-data "%VLC_DIR%\libvlc.dll;vlc" ^
+            --add-data "%VLC_DIR%\libvlccore.dll;vlc" ^
+            --add-data "%VLC_DIR%\plugins;vlc\plugins" ^
+            --hidden-import vlc ^
+            --hidden-import PyQt5 ^
+            --hidden-import requests ^
+            main.py
+        shell: cmd
+
+      - name: Copie des DLL VLC supplementaires
+        run: |
+          xcopy /E /I /Y "C:\Program Files\VideoLAN\VLC\*.dll" "dist\IPTV-Azure\vlc\"
+        shell: cmd
+
+      - name: Build Inno Setup installateur
+        run: |
+          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        shell: cmd
+
+      - name: Upload artifact - dossier dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Azure-dist
+          path: dist/IPTV-Azure/
+
+      - name: Upload artifact - installateur .exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: IPTV-Azure-Setup
+          path: Output/IPTV-Azure-Setup.exe
