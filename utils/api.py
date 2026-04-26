@@ -1,19 +1,85 @@
-# utils/api.py - Client Xtream API et parseur M3U
+# utils/api.py - Client Xtream API robuste + parseur M3U
 import requests
 import re
-import os
 import logging
-from config import API_TIMEOUT, CACHE_DIR
+from config import API_TIMEOUT
 
 logger = logging.getLogger(__name__)
+
+# Ports a tester automatiquement si aucun port dans l'URL
+FALLBACK_PORTS = [8080, 80, 25461, 2082, 8000]
+
+
+def normalize_host(host):
+    """
+    Normalise l'URL du serveur.
+    - Ajoute http:// si absent
+    - Conserve le port si deja present
+    - Retourne l'URL propre sans slash final
+    """
+    host = host.strip()
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = "http://" + host
+    return host.rstrip("/")
+
+
+def has_port(host):
+    """
+    Detecte si l'URL contient deja un port explicite.
+    Exemples :
+      http://mon.serveur.com:8080  -> True
+      http://mon.serveur.com       -> False
+      https://mon.serveur.com:443  -> True
+    """
+    try:
+        # Retire le schema
+        without_schema = re.sub(r'^https?://', '', host)
+        # Le hostname/ip peut contenir ':port'
+        parts = without_schema.split("/")[0]  # retire tout apres le premier /
+        return ":" in parts
+    except Exception:
+        return False
+
+
+def test_auth_url(host, username, password):
+    """
+    Tente une authentification sur un host donne.
+    Retourne (data_dict, None) si succes, (None, error_str) si echec.
+    """
+    url = f"{host}/player_api.php?username={username}&password={password}"
+    try:
+        resp = requests.get(url, timeout=API_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None, "Reponse JSON invalide"
+        user_info = data.get("user_info", {})
+        # Accepte auth=1 (int) OU auth='1' (string) OU absence de champ auth (certains serveurs)
+        auth_val = user_info.get("auth", 1)
+        if str(auth_val) == "0":
+            return None, "Identifiants incorrects (auth=0)"
+        return data, None
+    except requests.exceptions.Timeout:
+        return None, f"Timeout sur {host}"
+    except requests.exceptions.ConnectionError:
+        return None, f"Connexion impossible sur {host}"
+    except requests.exceptions.HTTPError as e:
+        return None, f"Erreur HTTP {e} sur {host}"
+    except ValueError:
+        return None, f"Reponse non-JSON sur {host}"
+    except Exception as e:
+        return None, str(e)
 
 
 class XtreamClient:
     def __init__(self, host, username, password):
-        self.host = host.rstrip("/")
+        self.host = normalize_host(host)
         self.username = username
         self.password = password
-        self.base_url = f"{self.host}/player_api.php?username={username}&password={password}"
+        self.base_url = (
+            f"{self.host}/player_api.php"
+            f"?username={username}&password={password}"
+        )
 
     def _get(self, params=""):
         url = self.base_url + (f"&{params}" if params else "")
@@ -22,56 +88,117 @@ class XtreamClient:
             resp.raise_for_status()
             return resp.json()
         except requests.exceptions.Timeout:
-            raise ConnectionError("Timeout: le serveur ne répond pas (>20s)")
+            raise ConnectionError("Timeout : le serveur ne repond pas (>20s)")
         except requests.exceptions.ConnectionError:
             raise ConnectionError("Impossible de joindre le serveur IPTV")
         except requests.exceptions.HTTPError as e:
-            raise ConnectionError(f"Erreur HTTP: {e}")
+            raise ConnectionError(f"Erreur HTTP : {e}")
         except ValueError:
-            raise ValueError("Réponse serveur invalide (JSON malformé)")
+            raise ValueError("Reponse serveur invalide (JSON malforme)")
+        except Exception as e:
+            raise ConnectionError(f"Erreur inattendue : {e}")
 
     def authenticate(self):
-        """Retourne les infos du compte ou lève une exception."""
-        data = self._get()
-        if not isinstance(data, dict):
-            raise ValueError("Réponse d'authentification invalide")
-        user_info = data.get("user_info", {})
-        if user_info.get("auth") == 0:
-            raise PermissionError("Identifiants incorrects")
-        return data
+        """
+        Authentification avec fallback automatique sur plusieurs ports.
+        Fonctionne pour : KDMAX (:8080), KING365 (sans port), Shooters (sans port).
+        """
+        # Tentative 1 : URL telle quelle
+        data, err = test_auth_url(self.host, self.username, self.password)
+        if data:
+            logger.info(f"Connexion reussie sur {self.host}")
+            return data
+
+        logger.warning(f"Echec sur {self.host} : {err}")
+
+        # Si l'URL n'a pas de port, on teste les ports alternatifs
+        if not has_port(self.host):
+            for port in FALLBACK_PORTS:
+                # Construit l'URL avec ce port
+                test_host = f"{self.host}:{port}"
+                data, err2 = test_auth_url(test_host, self.username, self.password)
+                if data:
+                    logger.info(f"Connexion reussie sur {test_host} (fallback)")
+                    # Met a jour le host pour les requetes suivantes
+                    self.host = test_host
+                    self.base_url = (
+                        f"{self.host}/player_api.php"
+                        f"?username={self.username}&password={self.password}"
+                    )
+                    return data
+                logger.warning(f"Echec sur {test_host} : {err2}")
+
+        # Si tout a echoue, on remonte l'erreur originale
+        raise ConnectionError(
+            f"Connexion impossible.\n"
+            f"Verifie l'URL, le port, le nom d'utilisateur et le mot de passe.\n"
+            f"Derniere erreur : {err}"
+        )
 
     def get_live_categories(self):
-        return self._get("action=get_live_categories") or []
+        try:
+            return self._get("action=get_live_categories") or []
+        except Exception as e:
+            logger.error(f"Erreur get_live_categories: {e}")
+            return []
 
     def get_live_streams(self, category_id=None):
-        params = "action=get_live_streams"
-        if category_id:
-            params += f"&category_id={category_id}"
-        return self._get(params) or []
+        try:
+            params = "action=get_live_streams"
+            if category_id:
+                params += f"&category_id={category_id}"
+            return self._get(params) or []
+        except Exception as e:
+            logger.error(f"Erreur get_live_streams: {e}")
+            return []
 
     def get_vod_categories(self):
-        return self._get("action=get_vod_categories") or []
+        try:
+            return self._get("action=get_vod_categories") or []
+        except Exception as e:
+            logger.error(f"Erreur get_vod_categories: {e}")
+            return []
 
     def get_vod_streams(self, category_id=None):
-        params = "action=get_vod_streams"
-        if category_id:
-            params += f"&category_id={category_id}"
-        return self._get(params) or []
+        try:
+            params = "action=get_vod_streams"
+            if category_id:
+                params += f"&category_id={category_id}"
+            return self._get(params) or []
+        except Exception as e:
+            logger.error(f"Erreur get_vod_streams: {e}")
+            return []
 
     def get_series_categories(self):
-        return self._get("action=get_series_categories") or []
+        try:
+            return self._get("action=get_series_categories") or []
+        except Exception as e:
+            logger.error(f"Erreur get_series_categories: {e}")
+            return []
 
     def get_series(self, category_id=None):
-        params = "action=get_series"
-        if category_id:
-            params += f"&category_id={category_id}"
-        return self._get(params) or []
+        try:
+            params = "action=get_series"
+            if category_id:
+                params += f"&category_id={category_id}"
+            return self._get(params) or []
+        except Exception as e:
+            logger.error(f"Erreur get_series: {e}")
+            return []
 
     def get_series_info(self, series_id):
-        return self._get(f"action=get_series_info&series_id={series_id}") or {}
+        try:
+            return self._get(f"action=get_series_info&series_id={series_id}") or {}
+        except Exception as e:
+            logger.error(f"Erreur get_series_info: {e}")
+            return {}
 
     def get_vod_info(self, vod_id):
-        return self._get(f"action=get_vod_info&vod_id={vod_id}") or {}
+        try:
+            return self._get(f"action=get_vod_info&vod_id={vod_id}") or {}
+        except Exception as e:
+            logger.error(f"Erreur get_vod_info: {e}")
+            return {}
 
     def build_live_url(self, stream_id, ext="ts"):
         return f"{self.host}/live/{self.username}/{self.password}/{stream_id}.{ext}"
@@ -86,7 +213,6 @@ class XtreamClient:
 class M3UParser:
     @staticmethod
     def parse_file(filepath):
-        """Parse un fichier M3U local, retourne une liste de dicts."""
         try:
             with open(filepath, "r", encoding="utf-8", errors="replace") as f:
                 content = f.read()
@@ -97,13 +223,12 @@ class M3UParser:
 
     @staticmethod
     def parse_url(url):
-        """Télécharge et parse un M3U depuis une URL."""
         try:
             resp = requests.get(url, timeout=API_TIMEOUT)
             resp.raise_for_status()
             return M3UParser.parse_content(resp.text)
         except Exception as e:
-            logger.error(f"Erreur téléchargement M3U {url}: {e}")
+            logger.error(f"Erreur telechargement M3U {url}: {e}")
             return []
 
     @staticmethod
